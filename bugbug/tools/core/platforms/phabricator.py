@@ -435,14 +435,19 @@ class PhabricatorPatch(Patch):
         return r.text
 
     async def _get_file_from_repo(self, file_path: str, commit_hash: str) -> str:
+        repo_ref = await self.github_repo_ref()
+        if repo_ref is None:
+            raise ValueError("No GitHub upstream is configured for this repository")
+
+        repo, _branch = repo_ref
         client = get_http_client()
         r = await client.get(
-            f"https://hg.mozilla.org/mozilla-unified/raw-file/{commit_hash}/{file_path}",
+            f"https://raw.githubusercontent.com/{repo}/{commit_hash}/{file_path}",
         )
 
         if r.status_code == 404:
-            raise FileNotFoundError(
-                f"File {file_path} not found in commit {commit_hash}"
+            raise ValueError(
+                f"File {file_path} is unavailable at exact Git base {commit_hash}"
             )
 
         r.raise_for_status()
@@ -487,14 +492,6 @@ class PhabricatorPatch(Patch):
 
         return raw_diff
 
-    @staticmethod
-    async def _commit_available(commit_hash: str) -> bool:
-        client = get_http_client()
-        r = await client.get(
-            f"https://hg.mozilla.org/mozilla-unified/json-rev/{commit_hash}",
-        )
-        return r.is_success
-
     @cached_property
     def _diff_metadata(self) -> dict:
         phabricator = get_phabricator_client()
@@ -512,38 +509,11 @@ class PhabricatorPatch(Patch):
 
     @alru_cache
     async def get_base_commit_hash(self) -> str:
-        diff = self._diff_metadata
-
-        try:
-            base_commit_hash = diff["refs"]["base"]["identifier"]
-            if await self._commit_available(base_commit_hash):
-                return base_commit_hash
-        except KeyError:
-            pass
-
-        end_date = datetime.fromtimestamp(diff["dateCreated"])
-        start_date = datetime.fromtimestamp(diff["dateCreated"] - 86400)
-        end_date_str = end_date.strftime("%Y-%m-%d %H:%M:%S")
-        start_date_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
-        client = get_http_client()
-        r = await client.get(
-            f"https://hg.mozilla.org/mozilla-central/json-pushes?startdate={start_date_str}&enddate={end_date_str}&version=2&tipsonly=1",
-        )
-        pushes = r.json()["pushes"]
-        closest_push = None
-        for push in pushes.values():
-            if diff["dateCreated"] - push["date"] < 0:
-                continue
-
-            if (
-                closest_push is None
-                or diff["dateCreated"] - push["date"]
-                < diff["dateCreated"] - closest_push["date"]
-            ):
-                closest_push = push
-
-        assert closest_push is not None
-        return closest_push["changesets"][0]
+        base = self._diff_metadata.get("refs", {}).get("base", {})
+        commit_hash = base.get("identifier")
+        if not commit_hash:
+            raise ValueError("Phabricator diff has no base revision")
+        return commit_hash
 
     @property
     def date_created(self) -> datetime:
@@ -728,18 +698,17 @@ class PhabricatorPatch(Patch):
         return self._revision_metadata["fields"].get("stackGraph", {})
 
     @cached_property
-    def patch_stack(self) -> list[PatchSet]:
-        """Return the ordered list of patch sets to apply to reach this revision.
+    def _stack_patches(self) -> list["PhabricatorPatch"]:
+        """Return patches from the bottom-most ancestor to this revision.
 
         Walks the Phabricator stackGraph from the bottom-most ancestor up to the
-        current revision. If the graph is non-linear (diamond / merge dependency),
-        only the current patch set is returned and an error is set.
+        current revision. A non-linear ancestry raises ValueError.
         """
         current_phid = self._revision_metadata["phid"]
         stack_graph = self.stack_graph
 
         if not stack_graph or current_phid not in stack_graph:
-            return [self.patch_set]
+            return [self]
 
         # Only walk the ancestry of current_phid — unrelated branches in
         # stack_graph may have diamonds that don't affect this patch's lineage.
@@ -759,11 +728,17 @@ class PhabricatorPatch(Patch):
         ordered_phids.reverse()
 
         return [
-            self.patch_set
-            if phid == current_phid
-            else self.__class__(revision_phid=phid).patch_set
+            self if phid == current_phid else self.__class__(revision_phid=phid)
             for phid in ordered_phids
         ]
+
+    @cached_property
+    def patch_stack(self) -> list[PatchSet]:
+        return [patch.patch_set for patch in self._stack_patches]
+
+    @property
+    def stack_base_patch(self) -> "PhabricatorPatch":
+        return self._stack_patches[0]
 
     @cached_property
     def _all_comments(self) -> list:

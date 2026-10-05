@@ -462,6 +462,32 @@ def test_load_skill_tool_description_lists_skills():
 # ---------------------------------------------------------------------------
 
 
+def test_expand_context_fetches_from_stack_base(monkeypatch):
+    base_patch = SimpleNamespace(
+        get_base_revision=AsyncMock(return_value="exact-base"),
+        get_old_file=AsyncMock(return_value="before\n"),
+    )
+    current_patch = SimpleNamespace(
+        patch_stack=[
+            PatchSet.from_string(
+                "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-before\n+after\n"
+            )
+        ],
+        stack_base_patch=base_patch,
+    )
+    monkeypatch.setattr(
+        langchain_tools,
+        "get_runtime",
+        lambda _: SimpleNamespace(context=SimpleNamespace(patch=current_patch)),
+    )
+    monkeypatch.setattr(langchain_tools, "_get_client", MagicMock)
+
+    result = asyncio.run(langchain_tools.expand_context.coroutine("file.txt"))
+
+    assert result == "1| after"
+    base_patch.get_old_file.assert_awaited_once_with("file.txt")
+
+
 def make_client(*, at_revision=None, latest=None):
     client = MagicMock()
     client.get_file_at_revision = AsyncMock(

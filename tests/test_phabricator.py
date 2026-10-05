@@ -3,14 +3,92 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this file,
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 
+import asyncio
 from datetime import timedelta
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from unittest.mock import patch as mock_patch
 
 import pytest
 
 from bugbug import phabricator
 from bugbug.tools.core.platforms import phabricator as phab_platform
+
+
+def test_get_old_file_uses_exact_git_base(monkeypatch) -> None:
+    base = "6ae7ad81504b6b8d1010aa2938002e7f31cb7910"
+
+    class FakePatch(phab_platform.PhabricatorPatch):
+        def __init__(self):
+            pass
+
+        @property
+        def _diff_metadata(self):
+            return {"refs": {"base": {"identifier": base}}}
+
+        async def github_repo_ref(self):
+            return "mozilla-firefox/firefox", "autoland"
+
+        async def _get_file_from_patch(self, file_path, is_before_patch):
+            raise FileNotFoundError(file_path)
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=MagicMock(status_code=200, text="exact file"))
+    monkeypatch.setattr(phab_platform, "get_http_client", lambda: client)
+
+    assert asyncio.run(FakePatch().get_old_file("toolkit/file.css")) == "exact file"
+    client.get.assert_awaited_once_with(
+        f"https://raw.githubusercontent.com/mozilla-firefox/firefox/{base}/toolkit/file.css"
+    )
+
+
+def test_unavailable_git_base_does_not_guess_another_revision(monkeypatch) -> None:
+    class FakePatch(phab_platform.PhabricatorPatch):
+        def __init__(self):
+            pass
+
+        @property
+        def _diff_metadata(self):
+            return {"refs": {"base": {"identifier": "5426149f616e4"}}}
+
+        async def github_repo_ref(self):
+            return "mozilla-firefox/firefox", "autoland"
+
+        async def _get_file_from_patch(self, file_path, is_before_patch):
+            raise FileNotFoundError(file_path)
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=MagicMock(status_code=404))
+    monkeypatch.setattr(phab_platform, "get_http_client", lambda: client)
+
+    with pytest.raises(ValueError, match="exact Git base 5426149f616e4"):
+        asyncio.run(FakePatch().get_old_file("toolkit/file.css"))
+    assert client.get.await_count == 1
+
+
+def test_stack_base_patch_is_bottom_ancestor() -> None:
+    class FakePatch(phab_platform.PhabricatorPatch):
+        def __init__(self, revision_phid="PHID-TOP"):
+            self._revision_phid = revision_phid
+
+        @property
+        def _revision_metadata(self):
+            return {"phid": self._revision_phid}
+
+        @property
+        def stack_graph(self):
+            return {
+                "PHID-BASE": [],
+                "PHID-MIDDLE": ["PHID-BASE"],
+                "PHID-TOP": ["PHID-MIDDLE"],
+            }
+
+        @property
+        def patch_set(self):
+            return phab_platform.PatchSet.from_string("")
+
+    patch = FakePatch()
+    assert patch.stack_base_patch.revision_phid == "PHID-BASE"
+    assert len(patch.patch_stack) == 3
 
 
 def test_get_first_review_time() -> None:
